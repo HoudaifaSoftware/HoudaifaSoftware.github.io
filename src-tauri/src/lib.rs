@@ -1,0 +1,336 @@
+// MediSmart Desktop — thin connected-client shell
+//
+// Architecture change (2025): The app no longer bundles a local PHP/Laravel runtime.
+// It simply loads the central hosted server (SERVER_URL) in a Tauri webview window.
+// Internet connectivity is required. This eliminates:
+//   - Bug 1 (migration_resources_invalid): the bundled-resource validation no longer exists.
+//   - Bug 2 (visible console): main.rs now has #![windows_subsystem = "windows"] and no
+//     external processes are spawned by the desktop shell.
+//
+// Kept:
+//   - System tray + hide-to-tray behaviour (desktop_behavior.rs)
+//   - Signed updater (updates.rs)
+//   - NavigationPolicy — rewritten for the hosted server origin
+//
+// Removed:
+//   - desktop.rs (PHP supervisor preparation)
+//   - runtime-core dependency
+//   - oauth_opener.rs Google Drive loopback flow (tied to local runtime port)
+//   - All LAN / offline-restore / tunnel commands
+
+mod desktop_behavior;
+mod updates;
+
+use std::{
+    fs,
+    sync::{Arc, RwLock},
+};
+
+use tauri::{
+    plugin::{Builder as PluginBuilder, TauriPlugin},
+    webview::WebviewWindowBuilder,
+    AppHandle, Manager, RunEvent, WebviewUrl,
+};
+use tauri_plugin_opener::OpenerExt;
+use url::Url;
+
+use crate::desktop_behavior::{install_system_tray, show_desktop_window, DesktopBehaviorState};
+use crate::updates::SignedUpdaterState;
+
+// ---------------------------------------------------------------------------
+// Server URL configuration
+// ---------------------------------------------------------------------------
+
+/// Compile-time default server URL. Override at runtime by placing a JSON file
+/// at `<app-local-data>/config/server.json` with content `{"url": "https://..."}`.
+/// The override is read once at startup and never re-read while the app is running.
+const DEFAULT_SERVER_URL: &str = "https://app.medismart.dz";
+
+/// Load the server URL: first checks the runtime override file, falls back to
+/// the compiled-in constant.  The override file is optional and silently ignored
+/// on any parse/IO error so a misconfigured file cannot prevent startup.
+fn resolve_server_url(app: &AppHandle) -> Url {
+    if let Ok(data_dir) = app.path().app_local_data_dir() {
+        let override_path = data_dir.join("config/server.json");
+        if let Ok(bytes) = fs::read(&override_path) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(url_str) = value.get("url").and_then(|v| v.as_str()) {
+                    if let Ok(url) = Url::parse(url_str) {
+                        if url.scheme() == "https"
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.fragment().is_none()
+                        {
+                            return url;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: compile-time constant (always valid, panics only in tests if
+    // the constant itself is malformed — caught at development time).
+    Url::parse(DEFAULT_SERVER_URL).expect("DEFAULT_SERVER_URL is a valid HTTPS URL")
+}
+
+// ---------------------------------------------------------------------------
+// NavigationPolicy — rewritten for hosted-server origin
+// ---------------------------------------------------------------------------
+
+/// Holds the server origin (scheme + host + optional port) and decides which
+/// navigations the webview may perform.
+///
+/// Rules:
+///   - Allow:   the configured server origin and all its sub-paths
+///   - Allow:   tauri://, asset://, about: (internal Tauri schemes)
+///   - Block:   everything else — external http(s) links are opened in the
+///     system browser by the on_navigation handler instead
+#[derive(Clone, Default)]
+struct NavigationPolicy {
+    /// The server origin, e.g. `https://app.medismart.dz`. Set once on startup.
+    server_origin: Arc<RwLock<Option<Url>>>,
+}
+
+impl NavigationPolicy {
+    fn set_server_url(&self, url: Url) {
+        if let Ok(mut current) = self.server_origin.write() {
+            *current = Some(url);
+        }
+    }
+
+    /// Returns true if the webview is allowed to navigate to `url` directly.
+    /// External HTTPS links that are not on the server origin are NOT allowed
+    /// here; the caller opens them in the system browser instead.
+    fn allows(&self, url: &Url) -> bool {
+        // Always allow internal Tauri / asset schemes used by the offline page
+        if matches!(url.scheme(), "tauri" | "asset" | "about")
+            || matches!(url.host_str(), Some("tauri.localhost" | "asset.localhost"))
+        {
+            return true;
+        }
+
+        let origin = match self.server_origin.read().ok().and_then(|o| o.clone()) {
+            Some(o) => o,
+            None => return false,
+        };
+
+        // Must match scheme + host exactly; port must also match (None == default)
+        url.scheme() == origin.scheme()
+            && url.host() == origin.host()
+            && url.port() == origin.port()
+            && url.username().is_empty()
+            && url.password().is_none()
+    }
+
+    /// Returns true if the URL is an external HTTPS link on a different origin
+    /// that should be opened in the system browser rather than allowed in-app.
+    fn is_external_link(&self, url: &Url) -> bool {
+        if url.scheme() != "https" {
+            return false;
+        }
+        !self.allows(url)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tauri setup
+// ---------------------------------------------------------------------------
+
+pub fn run() {
+    let navigation_policy = NavigationPolicy::default();
+    let policy_for_guard = navigation_policy.clone();
+
+    let application = tauri::Builder::default()
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _working_directory| {
+                show_desktop_window(app);
+            },
+        ))
+        // Navigation guard: allow server origin + tauri/asset schemes;
+        // open external HTTPS links in the system browser.
+        .plugin(navigation_guard(policy_for_guard))
+        .manage(DesktopBehaviorState::default())
+        .manage(SignedUpdaterState::compiled())
+        .invoke_handler(tauri::generate_handler![
+            updates::signed_updater_status,
+            updates::check_for_signed_update,
+            updates::install_signed_update
+        ])
+        .setup(move |app| {
+            if let Some(plugin) = updates::configured_plugin() {
+                app.handle().plugin(plugin)?;
+            }
+
+            install_system_tray(app.handle())?;
+
+            // Resolve which server URL to load (compile-time default or override file)
+            let server_url = resolve_server_url(app.handle());
+            navigation_policy.set_server_url(server_url.clone());
+
+            // Build the main window. It loads `index.html` (the offline/redirect
+            // page bundled as frontendDist) which immediately tries to navigate to
+            // the server URL and shows an offline error page on failure.
+            build_main_window(app, server_url)?;
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let behavior = window.app_handle().state::<DesktopBehaviorState>();
+                if behavior.should_hide_on_close(window.label()) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("failed to build the MediSmart desktop shell");
+
+    // No runtime shutdown needed — there are no supervised processes.
+    application.run(|_app, _event| {
+        if matches!(_event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+            // Nothing to clean up in thin-client mode.
+        }
+    });
+}
+
+/// Build the single main application window.
+/// The window loads the bundled `index.html` (frontendDist) as its initial
+/// page; that page's JavaScript immediately redirects to `server_url`.
+fn build_main_window(app: &mut tauri::App, server_url: Url) -> tauri::Result<()> {
+    WebviewWindowBuilder::new(
+        app,
+        "main",
+        // Start with the local loader page; it will navigate to the server URL.
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("MediSmart")
+    .inner_size(1440.0, 900.0)
+    .min_inner_size(1100.0, 720.0)
+    .center()
+    .resizable(true)
+    .maximizable(true)
+    // Inject the server URL into window so the loader page can read it.
+    .initialization_script(format!(
+        "window.__MEDISMART_SERVER_URL = {};",
+        serde_json::to_string(server_url.as_str()).unwrap_or_default()
+    ))
+    .build()?;
+
+    Ok(())
+}
+
+/// Tauri plugin that enforces the NavigationPolicy and opens external links in
+/// the system browser.
+fn navigation_guard(policy: NavigationPolicy) -> TauriPlugin<tauri::Wry> {
+    PluginBuilder::new("medismart-navigation-guard")
+        .on_navigation(move |webview, url| {
+            if policy.allows(url) {
+                return true;
+            }
+            // External HTTPS link on a different origin → open in system browser
+            if policy.is_external_link(url) {
+                let url_str = url.to_string();
+                let app = webview.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app.opener().open_url(&url_str, None::<&str>);
+                });
+            }
+            // Block in-webview navigation for anything not on the server origin
+            false
+        })
+        .build()
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_policy(server_url: &str) -> NavigationPolicy {
+        let policy = NavigationPolicy::default();
+        policy.set_server_url(Url::parse(server_url).unwrap());
+        policy
+    }
+
+    #[test]
+    fn server_origin_and_subpaths_are_allowed() {
+        let policy = make_policy("https://app.medismart.dz");
+
+        assert!(policy.allows(&Url::parse("https://app.medismart.dz").unwrap()));
+        assert!(policy.allows(&Url::parse("https://app.medismart.dz/").unwrap()));
+        assert!(policy.allows(&Url::parse("https://app.medismart.dz/login").unwrap()));
+        assert!(policy.allows(
+            &Url::parse("https://app.medismart.dz/patients/123/consultation").unwrap()
+        ));
+    }
+
+    #[test]
+    fn different_origin_is_blocked() {
+        let policy = make_policy("https://app.medismart.dz");
+
+        // Different host
+        assert!(!policy.allows(&Url::parse("https://evil.example.com/").unwrap()));
+        // Different scheme
+        assert!(!policy.allows(&Url::parse("http://app.medismart.dz/").unwrap()));
+        // Subdomain is NOT the same origin
+        assert!(!policy.allows(&Url::parse("https://sub.app.medismart.dz/").unwrap()));
+        // Port mismatch
+        assert!(!policy.allows(&Url::parse("https://app.medismart.dz:8443/").unwrap()));
+    }
+
+    #[test]
+    fn credentials_in_url_are_always_blocked() {
+        let policy = make_policy("https://app.medismart.dz");
+
+        assert!(!policy.allows(
+            &Url::parse("https://user:pass@app.medismart.dz/").unwrap()
+        ));
+    }
+
+    #[test]
+    fn tauri_and_asset_schemes_are_always_allowed() {
+        let policy = make_policy("https://app.medismart.dz");
+
+        assert!(policy.allows(&Url::parse("tauri://localhost/").unwrap()));
+        assert!(policy.allows(&Url::parse("asset://localhost/").unwrap()));
+        assert!(policy.allows(&Url::parse("about:blank").unwrap()));
+    }
+
+    #[test]
+    fn no_server_configured_blocks_everything_except_internal_schemes() {
+        let policy = NavigationPolicy::default(); // no server URL set
+
+        assert!(!policy.allows(&Url::parse("https://app.medismart.dz/").unwrap()));
+        // Internal schemes still pass
+        assert!(policy.allows(&Url::parse("tauri://localhost/").unwrap()));
+    }
+
+    #[test]
+    fn external_link_detection_is_correct() {
+        let policy = make_policy("https://app.medismart.dz");
+
+        // External HTTPS on a different host → should be opened in browser
+        assert!(policy.is_external_link(&Url::parse("https://example.com/docs").unwrap()));
+        // Same origin → not external
+        assert!(!policy.is_external_link(&Url::parse("https://app.medismart.dz/login").unwrap()));
+        // HTTP (non-HTTPS) on different host → not treated as an openable external link
+        assert!(!policy.is_external_link(&Url::parse("http://example.com/").unwrap()));
+    }
+
+    #[test]
+    fn default_server_url_is_valid_https() {
+        let url = Url::parse(DEFAULT_SERVER_URL).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert!(url.host_str().is_some());
+    }
+}
